@@ -77,11 +77,11 @@ pipeline {
         }
       }
     }
-
-    post {
-      always {
-        sh 'rm -rf ${WORKSPACE}/* ; \
+  }
+  post {
+    always {
+      sh 'rm -rf ${WORKSPACE}/* ; \
                 helm uninstall integrationtest --namespace testing'
-      }
     }
   }
+}
