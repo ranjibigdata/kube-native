@@ -1,31 +1,87 @@
 pipeline {
+
   agent any
+
+  environment {
+    MSR_FQDN_PORT = 'qip3zifrpqa6gdwce-2qtac556tyjufmasg.labs.strigo.io:4443'
+  }
+
   stages {
-    stage('Unit Test') {
-      steps {
-        sh 'mvn clean test'
-      }
-    }
-    stage('Deploy Standalone') {
-      steps {
-        sh 'mvn deploy -P standalone'
-      }
-    }
-    stage('Deploy AnyPoint') {
+    stage('Unit') {
       environment {
-        ANYPOINT_CREDENTIALS = credentials('anypoint.credentials')
+        MSR_ACCESS_KEY = credentials('jenkins-msr-access-token')
       }
       steps {
-        sh 'mvn deploy -P arm -Darm.target.name=local-4.0.0-ee -Danypoint.username=${ANYPOINT_CREDENTIALS_USR}  -Danypoint.password=${ANYPOINT_CREDENTIALS_PSW}'
+        sh 'docker --context=testserver login -u jenkins -p ${MSR_ACCESS_KEY} ${MSR_FQDN_PORT}'
+        sh 'docker --context=testserver image pull ${MSR_FQDN_PORT}/engineering/api-test:${TAG}'
+        sh 'kubectl run $(echo $TAG | tr . -) \
+                     -n testing \
+                     --restart=Never --attach=True \
+                     --overrides=\'{"apiVersion": "v1", "spec": {"nodeSelector": { "kubernetes.io/hostname": "testing" }}}\' \
+                     --image=${MSR_FQDN_PORT}/engineering/api-test:${TAG}'
       }
     }
-    stage('Deploy CloudHub') {
+    stage('Integration') {
       environment {
-        ANYPOINT_CREDENTIALS = credentials('anypoint.credentials')
+        MSR_ACCESS_KEY = credentials('jenkins-msr-access-token')
+        MAJORMINOR = '0.0'
       }
       steps {
-        sh 'mvn deploy -P cloudhub -Dmule.version=4.0.0 -Danypoint.username=${ANYPOINT_CREDENTIALS_USR} -Danypoint.password=${ANYPOINT_CREDENTIALS_PSW}'
+        // deploy our application for integration testing
+        sh 'BUILDNO=$(echo ${TAG} | sed "s/.*\\.//"); \
+                    helm install integrationtest --namespace testing --wait helm --set API.tag=rc-${MAJORMINOR}.${BUILDNO} --set environment.host=testing'
+        // make sure all pods are up before we try to run the integration tests
+        sh 'DBPOD=$(kubectl get pod -l app=db -n testing -o jsonpath="{.items[0].metadata.name}"); \
+                    APIPOD=$(kubectl get pod -l app=api -n testing -o jsonpath="{.items[0].metadata.name}"); \
+                    kubectl wait --timeout=60s --for=condition=Ready pod/${DBPOD} -n testing; \
+                    kubectl wait --timeout=60s --for=condition=Ready pod/${APIPOD} -n testing'
+
+        // run integration tests
+        sh 'BUILDNO=$(echo ${TAG} | sed "s/.*\\.//"); \
+                    kubectl run integration-${BUILDNO} \
+                        --image ${MSR_FQDN_PORT}/engineering/api-build:integration-${MAJORMINOR}.${BUILDNO} \
+                        -n testing --restart=Never --attach=True;'
+      }
+    }
+    stage('Finalization') {
+      environment {
+        MSR_ACCESS_KEY = credentials('jenkins-msr-access-token')
+        MAJORMINOR = '0.0'
+        DOCKER_CONTENT_TRUST_REPOSITORY_PASSPHRASE = credentials('jenkins-content-trust')
+        JENKINS_PK = credentials('jenkins-key')
+        MSR_CA = credentials('msr-ca')
+      }
+      steps {
+        sh 'docker --context=stageserver login -u jenkins -p ${MSR_ACCESS_KEY} ${MSR_FQDN_PORT} ; \
+                BUILDNO=$(echo ${TAG} | sed "s/.*\\.//"); \
+                curl -k https://${MSR_FQDN_PORT}/ca \
+                    -o /usr/local/share/ca-certificates/${MSR_FQDN_PORT}.crt ; \
+                update-ca-certificates; \
+                docker --context=stageserver trust key load ${JENKINS_PK}; \
+                docker --context=stageserver image pull \
+                    ${MSR_FQDN_PORT}/engineering/api-build:rc-${MAJORMINOR}.${BUILDNO}; \
+                docker --context=stageserver image tag \
+                    ${MSR_FQDN_PORT}/engineering/api-build:rc-${MAJORMINOR}.${BUILDNO} \
+                    ${MSR_FQDN_PORT}/engineering/api:${MAJORMINOR}.${BUILDNO} ; \
+                docker --context=stageserver trust sign ${MSR_FQDN_PORT}/engineering/api:${MAJORMINOR}.${BUILDNO} ; \
+                sed -i "s|api-build|api|g" helm/values.yaml ; \
+                sed -i "s|\'demo\'|${MAJORMINOR}.${BUILDNO}|g" helm/values.yaml ; \
+                helm package --version ${MAJORMINOR}.${BUILDNO} --destination releases helm ; \
+                helm push releases/demochart-${MAJORMINOR}.${BUILDNO}.tgz https://${MSR_FQDN_PORT}/charts/engineering/api --username jenkins --password ${MSR_ACCESS_KEY} --ca-file ${MSR_CA}'
+      }
+      stage('Deploy') {
+        steps {
+          sh 'BUILDNO=$(echo ${TAG} | sed "s/.*\\.//"); \
+                 cd releases; \
+                 helm install final --namespace staging demochart-0.0.${BUILDNO}.tgz'
+        }
+      }
+    }
+
+    post {
+      always {
+        sh 'rm -rf ${WORKSPACE}/* ; \
+                helm uninstall integrationtest --namespace testing'
       }
     }
   }
-}
